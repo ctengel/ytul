@@ -4,6 +4,7 @@ import sys
 import config
 import googleapiclient.discovery
 import pprint
+import pymongo
 
 class yt:
     def __init__(self):
@@ -12,13 +13,13 @@ class yt:
         DEVELOPER_KEY = config.ytkey
         self.youtube = googleapiclient.discovery.build(
             api_service_name, api_version, developerKey = DEVELOPER_KEY)
-        self.scache = {}
-        self.pcache = {}
-        self.vcache = {}
+        self.mongo = pymongo.MongoClient(config.mongo[0])[config.mongo[1]]
 
     def call(self, plid, npt=None):
-        if npt is None and plid in self.pcache:
-            return self.pcache[plid]
+        if npt is None:
+            chkmng = self.mongo.lists.find_one({'site': 'youtube.com', 'playlistId': plid})
+            if chkmng:
+                return chkmng['items'], chkmng['_id']
         request = self.youtube.playlistItems().list(
             part="snippet",
             playlistId=plid,
@@ -26,47 +27,67 @@ class yt:
             pageToken=npt
         )
         response = request.execute()
-        mines = response['items']
+        mines = response.pop('items')
         if response.get('nextPageToken'):
-            mines = mines + self.call(plid, response['nextPageToken'])
+            mines = mines + self.call(plid, response['nextPageToken'])[0]
+            del response['nextPageToken']
+        mngid = None
         if npt is None:
-            self.pcache[plid] = mines
-        return mines
+            response['site'] = 'youtube.com'
+            response['items'] = mines
+            response['paginated'] = True
+            response['playlistId'] = plid
+            mngid = self.mongo.lists.insert_one(response).inserted_id
+        return mines, mngid
     def details(self, vids):
         request = self.youtube.videos().list(
             part="snippet",
             id=",".join(vids)
         )
         response = request.execute()
-        return {x['id']: (x['snippet'].get('channelId'), x['snippet'].get('channelTitle')) for x in response['items']}
+        return response['items']
 
     def all_details(self, vids):
         vids = sorted(list(set(vids)))
         result = {}
-        for v in vids:
-            if v in self.vcache:
-                result[v] = self.vcache[v]
+        for v in vids.copy():
+            mngfnd = self.mongo.videos.find_one({'site': 'youtube.com', 'id': v})
+            if mngfnd:
+                result[v] = (mngfnd['snippet'].get('channelId'), mngfnd['snippet'].get('channelTitle'), mngfnd['_id'])
                 vids.remove(v)
         multivids = [vids[i:i+50] for i in range(0, len(vids), 50)]
+        newresult = []
         for sub in multivids:
-            result.update(self.details(sub))
-        self.vcache.update(result)
+            newresult = list(newresult + self.details(sub))
+        for i in newresult:
+            i['site'] = 'youtube.com'
+        newdict = {}
+        if newresult:
+            newids = list(self.mongo.videos.insert_many(newresult).inserted_ids)
+            newdict = {x[0]['id']: (x[0]['snippet'].get('channelId'), x[0]['snippet'].get('channelTitle'), x[1]) for x in list(zip(newresult, newids))}
+        result.update(newdict)
         return result
 
 
     def taglist(self, pl):
-        vids = [x['snippet']['resourceId']['videoId'] for x in pl]
+        # TODO actually tag the list within Mongo... this is not doing that
+        mngfnd = self.mongo.lists.find_one(pl)['items']
+        vids = [x['snippet']['resourceId']['videoId'] for x in mngfnd]
         alldets = self.all_details(vids)
         newdict = {}
-        for x in pl:
-            x['realChanTitle'] = alldets.get(x.get('snippet',{}).get('resourceId',{}).get('videoId'),[None, None])[1]
-            x['realChanId'] = alldets.get(x.get('snippet',{}).get('resourceId',{}).get('videoId'),[None, None])[0]
+        for x in mngfnd:
+            rawdets = alldets.get(x['snippet']['resourceId']['videoId'], (None, None, None))
+            x['realChanTitle'] = rawdets[1]
+            x['realChanId'] = rawdets[2]
+            x['video'] = rawdets[2]
             newdict[x['snippet']['resourceId']['videoId']] = x
         return newdict
 
     def ytsearch(self, string):
-        if string in self.scache:
-            return self.scache[string]
+        mngfnd = self.mongo.searches.find_one({'site': 'youtube.com', 'q': string})
+        if mngfnd:
+            print('gotit')
+            return [x['id']['playlistId'] for x in mngfnd['items']], mngfnd
         request = self.youtube.search().list(
                 part='id',
                 maxResults=50,
@@ -76,8 +97,11 @@ class yt:
                 )
         response = request.execute()
         answer =  [x['id']['playlistId'] for x in response['items']]
-        self.scache[string] = answer
-        return answer
+        response['site'] = 'youtube.com'
+        response['paginated'] = False
+        response['q'] = string
+        self.mongo.searches.insert_one(response)
+        return answer, response
 
 def filtbychan(pl, by):
     return {k: v for k,v in pl.items() if v['realChanTitle'] in by or v['realChanId'] in by}
@@ -96,8 +120,8 @@ if __name__ == "__main__":
     fullist = {}
     pllist = []
     for i in listy:
-        pllist = pllist + YOUTUBE.ytsearch(i)
+        pllist = pllist + YOUTUBE.ytsearch(i)[0]
     pllist = sorted(list(set(pllist)))
     for i in pllist:
-        fullist.update(filtbychan(YOUTUBE.taglist(YOUTUBE.call(i)),listy))
+        fullist.update(filtbychan(YOUTUBE.taglist(YOUTUBE.call(i)[1]),listy))
     print_readable(fullist)
